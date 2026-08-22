@@ -7,16 +7,15 @@ import {
 import { Reflector } from '@nestjs/core';
 import { JwtService } from '@nestjs/jwt';
 import { IS_PUBLIC_KEY } from '@common/decorators';
-import { AuthService, JwtPayload } from '@modules/auth';
+import { AuthService, JwtPayload } from '@/modules/auth/auth.service';
 
 /**
  * Combined auth guard that supports (in priority order):
  * 1. JWT in httpOnly cookie `accessToken` (browser / frontend)
  * 2. JWT Bearer token in Authorization header (mobile / Swagger)
- * 3. X-API-Key header (service-to-service)
- * 4. @Public() decorator to bypass auth
+ * 3. @Public() decorator to bypass auth
  *
- * Attaches `req.user` and optionally `req.apiKeyScopes`.
+ * Attaches `req.user`.
  */
 @Injectable()
 export class AuthGuard implements CanActivate {
@@ -49,8 +48,12 @@ export class AuthGuard implements CanActivate {
 
     // 3. Try JWT Bearer header (mobile / Swagger)
     const headers = request.headers as Record<string, string | undefined>;
-    const authHeader = headers['authorization'];
-    if (authHeader?.startsWith('Bearer ')) {
+    const authHeader = headers?.['authorization'] || headers?.['Authorization'];
+    if (
+      authHeader &&
+      typeof authHeader === 'string' &&
+      authHeader.startsWith('Bearer ')
+    ) {
       return this.validateJwt(request, authHeader.slice(7));
     }
 

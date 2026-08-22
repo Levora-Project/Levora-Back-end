@@ -136,6 +136,9 @@ export class AuthService {
   // ── Refresh Token ────────────────────────────
   async refreshToken(dto: RefreshTokenDto | string) {
     const token = typeof dto === 'string' ? dto : dto.refreshToken;
+    if (!token) {
+      throw new UnauthorizedException('Refresh token is required');
+    }
     try {
       const payload = await this.jwt.verifyAsync<JwtPayload>(token);
       const user = await this.usersService.findById(payload.sub);

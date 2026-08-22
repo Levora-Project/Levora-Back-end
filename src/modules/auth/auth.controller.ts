@@ -8,6 +8,7 @@ import {
   HttpCode,
   HttpStatus,
   UnauthorizedException,
+  UseGuards,
 } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
 import {
@@ -28,6 +29,7 @@ import {
   UserResponseDto,
 } from './dto';
 import { Public, CurrentUser } from '@common/decorators';
+import { AuthGuard } from '@common/guards';
 import { ErrorResponse } from '@common/dto';
 
 const ACCESS_COOKIE = 'accessToken';
@@ -161,6 +163,7 @@ export class AuthController {
   }
 
   @Post('logout')
+  @UseGuards(AuthGuard)
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Logout (clear cookies)' })
@@ -170,6 +173,7 @@ export class AuthController {
   }
 
   @Get('me')
+  @UseGuards(AuthGuard)
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Get current user profile' })
   @ApiResponse({

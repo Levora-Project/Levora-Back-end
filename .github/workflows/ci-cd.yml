@@ -12,7 +12,15 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+permissions:
+  contents: read
+  deployments: write
+  actions: read
+
 jobs:
+  # =========================================================================
+  # 1. LINT & FORMAT CHECKS (Existing)
+  # =========================================================================
   lint-and-format:
     name: Lint & Format Checks
     runs-on: ubuntu-latest
@@ -48,6 +56,9 @@ jobs:
       - name: Verify Build
         run: pnpm build
 
+  # =========================================================================
+  # 2. UNIT, INTEGRATION & E2E TESTS (Existing)
+  # =========================================================================
   test:
     name: Unit, Integration & E2E Tests
     runs-on: ubuntu-latest
@@ -120,6 +131,9 @@ jobs:
       - name: Run E2E Tests
         run: pnpm test:e2e
 
+  # =========================================================================
+  # 3. BUILD & TEST CONTAINER (Existing)
+  # =========================================================================
   build-and-test-container:
     name: Build & Test Container
     needs: [test]
@@ -255,23 +269,255 @@ jobs:
         if: always()
         run: docker stop levora-app || true
 
-  deploy:
-    name: Deploy to Render
+  # =========================================================================
+  # 4. DEPLOY TO STAGING
+  # =========================================================================
+  deploy-staging:
+    name: Deploy to Staging
     needs: [lint-and-format, test, build-and-test-container]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
     steps:
-      - name: Trigger Render Deploy Hook
+      - name: Trigger Render Staging Deployment
         env:
-          DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY_STAGING }}
+          SERVICE_ID: ${{ secrets.RENDER_STAGING_SERVICE_ID }}
         run: |
-          if [ -z "$DEPLOY_HOOK_URL" ]; then
-            echo "::error::RENDER_DEPLOY_HOOK_URL secret is not set or empty in repository settings."
+          if [ -z "$RENDER_API_KEY" ] || [ -z "$SERVICE_ID" ]; then
+            echo "::error::RENDER_API_KEY_STAGING or RENDER_STAGING_SERVICE_ID is not configured."
             exit 1
           fi
 
-          echo "Triggering deployment on Render..."
+          echo "Triggering Staging deployment on Render for ref '${{ github.ref_name }}'..."
+          response=$(curl -s -w "\n%{http_code}" -X POST "https://api.render.com/v1/services/$SERVICE_ID/deploys" \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"ref": "${{ github.ref_name }}", "clearCache": "true"}')
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+
+          echo "Render API Response: $body"
+          echo "HTTP Status Code: $http_code"
+
+          if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+            echo "::notice::Staging deployment triggered successfully (HTTP $http_code)."
+          else
+            echo "::error::Render Staging deployment failed with HTTP status $http_code: $body"
+            exit 1
+          fi
+
+  # =========================================================================
+  # 5. WAIT FOR STAGING DEPLOYMENT
+  # =========================================================================
+  wait-for-staging:
+    name: Wait for Staging Deployment
+    needs: [deploy-staging]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Poll Render Staging Deployment Status
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY_STAGING }}
+          SERVICE_ID: ${{ secrets.RENDER_STAGING_SERVICE_ID }}
+        run: |
+          if [ -z "$RENDER_API_KEY" ] || [ -z "$SERVICE_ID" ]; then
+            echo "::error::RENDER_API_KEY_STAGING or RENDER_STAGING_SERVICE_ID is not configured."
+            exit 1
+          fi
+
+          echo "Polling Render API for Staging service ($SERVICE_ID) deployment status..."
+          START_TIME=$(date +%s)
+          TIMEOUT=300
+
+          while true; do
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - START_TIME))
+
+            if [ $ELAPSED -ge $TIMEOUT ]; then
+              echo "::error::Staging deployment timed out after 5 minutes ($ELAPSED seconds)."
+              exit 1
+            fi
+
+            RESPONSE=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" \
+              "https://api.render.com/v1/services/$SERVICE_ID/deploys?limit=1")
+
+            STATUS=$(echo "$RESPONSE" | jq -r '.[0].deploy.status // .[0].status // empty')
+
+            echo "Current Staging deployment status: '$STATUS' (Elapsed: ${ELAPSED}s / ${TIMEOUT}s)"
+
+            case "$STATUS" in
+              "live")
+                echo "Staging deployment is LIVE and healthy!"
+                exit 0
+                ;;
+              "failed"|"build_failed"|"deploy_failed"|"canceled"|"deactivated")
+                echo "::error::Staging deployment failed with status: $STATUS"
+                echo "Full response: $RESPONSE"
+                exit 1
+                ;;
+              "created"|"build_in_progress"|"update_in_progress"|"in_progress"|"pending"|*)
+                echo "Deployment in progress (status: ${STATUS:-unknown}). Waiting 60 seconds before retrying..."
+                sleep 60
+                ;;
+            esac
+          done
+
+  # =========================================================================
+  # 6. RUN SMOKE TESTS (Newman)
+  # =========================================================================
+  run-smoke-tests:
+    name: Run API Smoke Tests (Newman)
+    needs: [wait-for-staging]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Newman
+        run: npm install -g newman
+
+      - name: Run Newman Smoke Tests Against Staging
+        run: |
+          newman run tests/levora-smoke-tests.json \
+            --env-var baseUrl=https://levora-back-end.onrender.com/api/v1 \
+            --reporters cli,json \
+            --reporter-json-export newman-report.json
+
+      - name: Temporary Upload of Newman Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: newman-report
+          path: newman-report.json
+          retention-days: 1
+
+  # =========================================================================
+  # 7. CREATE STAGING GITHUB DEPLOYMENT RECORD
+  # =========================================================================
+  create-staging-deployment:
+    name: Create Staging Deployment Record
+    needs: [deploy-staging, wait-for-staging, run-smoke-tests]
+    if: always() && !cancelled() && needs.deploy-staging.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      deployments: write
+      contents: read
+
+    steps:
+      - name: Record Staging Deployment Status
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          STAGING_STATE="${{ (needs.wait-for-staging.result == 'success' && needs.run-smoke-tests.result == 'success') && 'success' || 'failure' }}"
+          echo "Creating GitHub Deployment record for Staging (state: $STAGING_STATE)..."
+
+          DEPLOY_RESP=$(curl -s -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/deployments \
+            -d '{
+              "ref": "${{ github.sha }}",
+              "environment": "staging",
+              "auto_merge": false,
+              "required_contexts": []
+            }')
+
+          DEPLOYMENT_ID=$(echo "$DEPLOY_RESP" | jq -r '.id // empty')
+          if [ -n "$DEPLOYMENT_ID" ]; then
+            curl -s -X POST \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/${{ github.repository }}/deployments/$DEPLOYMENT_ID/statuses \
+              -d "{
+                \"state\": \"$STAGING_STATE\",
+                \"environment_url\": \"https://levora-back-end.onrender.com\",
+                \"log_url\": \"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+              }"
+            echo "Staging deployment record #$DEPLOYMENT_ID updated with state $STAGING_STATE"
+          else
+            echo "Failed to create Staging deployment record: $DEPLOY_RESP"
+          fi
+
+  # =========================================================================
+  # 8. SAVE STAGING LOGS & ARTIFACTS (Always Executes for Staging)
+  # =========================================================================
+  save-staging-logs:
+    name: Save Staging Logs & Artifacts
+    needs: [deploy-staging, wait-for-staging, run-smoke-tests, create-staging-deployment]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - name: Download Newman Report
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: newman-report
+          path: .
+
+      - name: Collect Staging Logs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RENDER_API_KEY_STAGING: ${{ secrets.RENDER_API_KEY_STAGING }}
+          RENDER_STAGING_SERVICE_ID: ${{ secrets.RENDER_STAGING_SERVICE_ID }}
+        run: |
+          echo "Collecting GitHub Actions build logs..."
+          gh run view ${{ github.run_id }} --log > build-logs.txt 2>&1 || echo "Build logs could not be retrieved via GitHub CLI" > build-logs.txt
+
+          echo "Collecting Render Staging logs..."
+          if [ -n "$RENDER_API_KEY_STAGING" ] && [ -n "$RENDER_STAGING_SERVICE_ID" ]; then
+            curl -s -H "Authorization: Bearer $RENDER_API_KEY_STAGING" \
+              "https://api.render.com/v1/services/$RENDER_STAGING_SERVICE_ID/logs?limit=200" > staging-logs.txt 2>&1 || echo "Failed to fetch Render Staging logs" > staging-logs.txt
+          else
+            echo "Render Staging credentials not configured" > staging-logs.txt
+          fi
+
+          if [ ! -f newman-report.json ]; then
+            echo '{"info": "No Newman report generated or tests were skipped"}' > newman-report.json
+          fi
+
+      - name: Upload Staging Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-logs-${{ github.run_id }}
+          path: |
+            build-logs.txt
+            staging-logs.txt
+            newman-report.json
+
+  # =========================================================================
+  # 9. DEPLOY TO PRODUCTION (Manual Approval Required via GitHub Environment)
+  # =========================================================================
+  deploy-production:
+    name: Deploy to Production
+    needs: [run-smoke-tests]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://levora-back-end-production.onrender.com
+
+    steps:
+      - name: Trigger Render Production Deploy Hook
+        env:
+          DEPLOY_HOOK_URL: ${{ secrets.RENDER_PRODUCTION_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$DEPLOY_HOOK_URL" ]; then
+            echo "::error::RENDER_PRODUCTION_DEPLOY_HOOK secret is not set or empty in repository settings."
+            exit 1
+          fi
+
+          echo "Triggering Production deployment on Render..."
           response=$(curl -s -w "\n%{http_code}" -X POST "$DEPLOY_HOOK_URL")
           http_code=$(echo "$response" | tail -n1)
           body=$(echo "$response" | sed '$d')
@@ -280,8 +526,146 @@ jobs:
           echo "HTTP Status Code: $http_code"
 
           if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
-            echo "::notice::Deployment hook triggered successfully (HTTP $http_code)."
+            echo "::notice::Production deploy hook triggered successfully (HTTP $http_code)."
           else
-            echo "::error::Render deploy hook failed with HTTP status $http_code: $body"
+            echo "::error::Render Production deploy hook failed with HTTP status $http_code: $body"
             exit 1
           fi
+
+  # =========================================================================
+  # 10. WAIT FOR PRODUCTION DEPLOYMENT
+  # =========================================================================
+  wait-for-production:
+    name: Wait for Production Deployment
+    needs: [deploy-production]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Poll Render Production Deployment Status
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY_PRODUCTION }}
+          SERVICE_ID: ${{ secrets.RENDER_PRODUCTION_SERVICE_ID }}
+        run: |
+          if [ -z "$RENDER_API_KEY" ] || [ -z "$SERVICE_ID" ]; then
+            echo "::error::RENDER_API_KEY_PRODUCTION or RENDER_PRODUCTION_SERVICE_ID is not configured."
+            exit 1
+          fi
+
+          echo "Polling Render API for Production service ($SERVICE_ID) deployment status..."
+          START_TIME=$(date +%s)
+          TIMEOUT=300
+
+          while true; do
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - START_TIME))
+
+            if [ $ELAPSED -ge $TIMEOUT ]; then
+              echo "::error::Production deployment timed out after 5 minutes ($ELAPSED seconds)."
+              exit 1
+            fi
+
+            RESPONSE=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" \
+              "https://api.render.com/v1/services/$SERVICE_ID/deploys?limit=1")
+
+            STATUS=$(echo "$RESPONSE" | jq -r '.[0].deploy.status // .[0].status // empty')
+
+            echo "Current Production deployment status: '$STATUS' (Elapsed: ${ELAPSED}s / ${TIMEOUT}s)"
+
+            case "$STATUS" in
+              "live")
+                echo "Production deployment is LIVE and healthy!"
+                exit 0
+                ;;
+              "failed"|"build_failed"|"deploy_failed"|"canceled"|"deactivated")
+                echo "::error::Production deployment failed with status: $STATUS"
+                echo "Full response: $RESPONSE"
+                exit 1
+                ;;
+              "created"|"build_in_progress"|"update_in_progress"|"in_progress"|"pending"|*)
+                echo "Deployment in progress (status: ${STATUS:-unknown}). Waiting 60 seconds before retrying..."
+                sleep 60
+                ;;
+            esac
+          done
+
+  # =========================================================================
+  # 11. CREATE PRODUCTION GITHUB DEPLOYMENT RECORD
+  # =========================================================================
+  create-production-deployment:
+    name: Create Production Deployment Record
+    needs: [deploy-production, wait-for-production]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && always() && !cancelled() && needs.deploy-production.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      deployments: write
+      contents: read
+
+    steps:
+      - name: Record Production Deployment Status
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PROD_STATE="${{ needs.wait-for-production.result == 'success' && 'success' || 'failure' }}"
+          echo "Creating GitHub Deployment record for Production (state: $PROD_STATE)..."
+
+          DEPLOY_RESP=$(curl -s -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/deployments \
+            -d '{
+              "ref": "${{ github.sha }}",
+              "environment": "production",
+              "auto_merge": false,
+              "required_contexts": []
+            }')
+
+          DEPLOYMENT_ID=$(echo "$DEPLOY_RESP" | jq -r '.id // empty')
+          if [ -n "$DEPLOYMENT_ID" ]; then
+            curl -s -X POST \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/${{ github.repository }}/deployments/$DEPLOYMENT_ID/statuses \
+              -d "{
+                \"state\": \"$PROD_STATE\",
+                \"environment_url\": \"https://levora-back-end-production.onrender.com\",
+                \"log_url\": \"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+              }"
+            echo "Production deployment record #$DEPLOYMENT_ID updated with state $PROD_STATE"
+          else
+            echo "Failed to create Production deployment record: $DEPLOY_RESP"
+          fi
+
+  # =========================================================================
+  # 12. SAVE PRODUCTION LOGS & ARTIFACTS (Always Executes for Production)
+  # =========================================================================
+  save-production-logs:
+    name: Save Production Logs & Artifacts
+    needs: [deploy-production, wait-for-production, create-production-deployment]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && always()
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - name: Collect Production Logs
+        env:
+          RENDER_API_KEY_PRODUCTION: ${{ secrets.RENDER_API_KEY_PRODUCTION }}
+          RENDER_PRODUCTION_SERVICE_ID: ${{ secrets.RENDER_PRODUCTION_SERVICE_ID }}
+        run: |
+          echo "Collecting Render Production logs..."
+          if [ -n "$RENDER_API_KEY_PRODUCTION" ] && [ -n "$RENDER_PRODUCTION_SERVICE_ID" ]; then
+            curl -s -H "Authorization: Bearer $RENDER_API_KEY_PRODUCTION" \
+              "https://api.render.com/v1/services/$RENDER_PRODUCTION_SERVICE_ID/logs?limit=200" > production-logs.txt 2>&1 || echo "Failed to fetch Render Production logs" > production-logs.txt
+          else
+            echo "Render Production credentials not configured or deployment was not triggered" > production-logs.txt
+          fi
+
+      - name: Upload Production Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-logs-${{ github.run_id }}
+          path: |
+            production-logs.txt
